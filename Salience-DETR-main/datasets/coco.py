@@ -4,6 +4,7 @@ import albumentations as A
 import cv2
 import numpy as np
 import torchvision
+import PIL
 
 from transforms import v2 as T
 from transforms.convert_coco_polys_to_mask import ConvertCocoPolysToMask
@@ -51,10 +52,12 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         cv2.setNumThreads(0)
         cv2.ocl.setUseOpenCL(False)
 
-        # image = cv2.imread(os.path.join(self.root, image_name))
-        image = cv2.imdecode(np.fromfile(os.path.join(self.root, image_name), dtype=np.uint8), -1)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
-        return image
+        image_path = os.path.join(self.root, image_name)
+        image = cv2.imread(image_path)
+        if image is None:
+            raise RuntimeError(f"Failed to load image: {image_path}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return PIL.Image.fromarray(image)
 
     def get_image_id(self, item: int):
         if hasattr(self, "indices"):
@@ -78,7 +81,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         bounding_boxes = datapoints.BoundingBox(
             target["boxes"],
             format=datapoints.BoundingBoxFormat.XYXY,
-            spatial_size=image.shape[-2:],
+            spatial_size=image.shape[-2:],  # Use shape from the datapoints.Image
         )
         labels = target["labels"]
         if self._transforms is not None:

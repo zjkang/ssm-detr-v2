@@ -161,30 +161,37 @@ class SalienceDETR(DNDETRDetector):
         self.focus_criterion = focus_criterion
 
     def forward(self, images: List[Tensor], targets: List[Dict] = None):
-        # get original image sizes, used for postprocess
-        original_image_sizes = self.query_original_sizes(images)
+        # batch_size = 2
+        # get original image sizes, used for postprocess; 
+        # original_image_sizes: [2,2(h,w)]
+        original_image_sizes = self.query_original_sizes(images) 
+        # images: ImageList, [size(736,1110),size(800,1059)]
+        # targets: tuple each is {boxes, labels, image_id}
+        # mask: [2,800,1120]
         images, targets, mask = self.preprocess(images, targets)
 
-        # extract features
+        # extract features multi_level_feats(dict): {level2,level3,level4}
         multi_level_feats = self.backbone(images.tensors)
+        # multi_level_feats(list): 4 levels
+        # l0: [2,256,100,140], l1: [2,256,50,70], l2: [2,256,25,35], l3: [2,256,13,18]
         multi_level_feats = self.neck(multi_level_feats)
 
-        multi_level_masks = []
-        multi_level_position_embeddings = []
+        multi_level_masks = [] # m[0]: [2,100,140]
+        multi_level_position_embeddings = [] #p[0]: [2,256,100,140]
         for feature in multi_level_feats:
             multi_level_masks.append(F.interpolate(mask[None], size=feature.shape[-2:]).to(torch.bool)[0])
             multi_level_position_embeddings.append(self.position_embedding(multi_level_masks[-1]))
 
         if self.training:
             # collect ground truth for denoising generation
-            gt_labels_list = [t["labels"] for t in targets]
-            gt_boxes_list = [t["boxes"] for t in targets]
+            gt_labels_list = [t["labels"] for t in targets] # [[label],[label]]
+            gt_boxes_list = [t["boxes"] for t in targets] # [[box],[box]]
             noised_results = self.denoising_generator(gt_labels_list, gt_boxes_list)
-            noised_label_query = noised_results[0]
-            noised_box_query = noised_results[1]
-            attn_mask = noised_results[2]
-            denoising_groups = noised_results[3]
-            max_gt_num_per_image = noised_results[4]
+            noised_label_query = noised_results[0] # [2,196,256]
+            noised_box_query = noised_results[1] # [2,196,4]
+            attn_mask = noised_results[2] # [1096,1096] 900 queries + 196 denoising queries
+            denoising_groups = noised_results[3] # 7
+            max_gt_num_per_image = noised_results[4] # 28
         else:
             noised_label_query = None
             noised_box_query = None
