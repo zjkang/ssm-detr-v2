@@ -8,9 +8,6 @@ from models.bricks.base_transformer import TwostageTransformer
 from models.bricks.basic import MLP
 from models.bricks.position_encoding import get_sine_pos_embed
 from models.bricks.ms_deform_attn import MultiScaleDeformableAttention
-# from models.bricks.relation_transformer import (
-#     PositionRelationEmbedding,
-# )
 from util.misc import inverse_sigmoid
 
 import math
@@ -20,7 +17,6 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Optional, Tuple, Dict
 
-# 假设我们已经有了这些辅助模块
 from models.bricks.basic import MLP
 from models.bricks.position_encoding import get_sine_pos_embed
 
@@ -100,7 +96,6 @@ class SsmTransformer(TwostageTransformer):
         # initiailize encoder and hybrid regression layers
         nn.init.constant_(self.encoder_bbox_head.layers[-1].weight, 0.0)
         nn.init.constant_(self.encoder_bbox_head.layers[-1].bias, 0.0)
-
         # initialize pos_trans
         nn.init.xavier_uniform_(self.pos_trans.weight)
         # initialize alpha
@@ -272,7 +267,6 @@ class SsmTransformerEncoder(nn.Module):
                 level_start_index,
                 query_key_padding_mask,
             )
-
         return query
 
 
@@ -345,115 +339,6 @@ class SsmTransformerEncoderLayer(nn.Module):
         query = self.forward_ffn(query)
 
         return query
-
-
-# class SsmTransformerDecoder(nn.Module):
-#     def __init__(self, decoder_layer, num_layers, num_classes):
-#         super().__init__()
-#         # parameters
-#         self.embed_dim = decoder_layer.embed_dim
-#         self.num_heads = decoder_layer.num_heads
-#         self.num_layers = num_layers
-#         self.num_classes = num_classes
-
-#         # decoder layers and embedding
-#         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
-#         # NOTE: the ref_point_head of Deformable is split from pos_trans and pos_norm,
-#         # which is different from DINO
-#         self.ref_point_head = nn.Sequential(
-#             nn.Linear(2 * self.embed_dim, self.embed_dim), nn.LayerNorm(self.embed_dim)
-#         )
-
-#         # iterative bounding box refinement
-#         class_head = nn.Linear(self.embed_dim, num_classes)
-#         bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
-#         self.class_head = nn.ModuleList([copy.deepcopy(class_head) for _ in range(num_layers)])
-#         self.bbox_head = nn.ModuleList([copy.deepcopy(bbox_head) for _ in range(num_layers)])
-
-#         self.position_relation_embedding = PositionRelationEmbedding(16, self.num_heads)
-
-#         self.init_weights()
-
-#     def init_weights(self):
-#         # initialize decoder layers
-#         for layer in self.layers:
-#             if hasattr(layer, "init_weights"):
-#                 layer.init_weights()
-#         # initialize decoder classification layers
-#         prior_prob = 0.01
-#         bias_value = -math.log((1 - prior_prob) / prior_prob)
-#         for class_head in self.class_head:
-#             nn.init.constant_(class_head.bias, bias_value)
-#         # initiailize decoder regression layers
-#         for bbox_head in self.bbox_head:
-#             nn.init.constant_(bbox_head.layers[-1].weight, 0.0)
-#             nn.init.constant_(bbox_head.layers[-1].bias, 0.0)
-
-#         # initialize ref_point_head
-#         nn.init.xavier_uniform_(self.ref_point_head[0].weight)
-
-#     def forward(
-#         self,
-#         query,
-#         reference_points,
-#         value,
-#         spatial_shapes,
-#         level_start_index,
-#         valid_ratios,
-#         key_padding_mask=None,
-#         attn_mask=None,
-#     ):
-#         # NOTE: the difference between DeformableDecoder and DabDecoder is that
-#         # Deformable does not introduce reference refinement for query pos
-#         query_sine_embed = get_sine_pos_embed(
-#             reference_points, self.embed_dim // 2, exchange_xy=False
-#         )
-#         query_pos = self.ref_point_head(query_sine_embed)
-
-#         outputs_classes, outputs_coords = [], []
-#         valid_ratio_scale = torch.cat([valid_ratios, valid_ratios], -1)[:, None]
-
-#         for layer_idx, layer in enumerate(self.layers):
-#             reference_points_input = reference_points.detach()[:, :, None] * valid_ratio_scale
-
-#             query = layer(
-#                 query=query,
-#                 query_pos=query_pos,
-#                 reference_points=reference_points_input,
-#                 value=value,
-#                 spatial_shapes=spatial_shapes,
-#                 level_start_index=level_start_index,
-#                 key_padding_mask=key_padding_mask,
-#                 self_attn_mask=attn_mask,
-#             )
-
-#             # get output
-#             output_class = self.class_head[layer_idx](query)
-#             output_coord = self.bbox_head[layer_idx](query) + inverse_sigmoid(reference_points)
-#             output_coord = output_coord.sigmoid()
-#             outputs_classes.append(output_class)
-#             outputs_coords.append(output_coord)
-
-#             if layer_idx == self.num_layers - 1:
-#                 break
-
-#             # NOTE: Here we integrate position_relation_embedding into DN-Deformable-DETR
-#             src_boxes = tgt_boxes if layer_idx >= 1 else reference_points
-#             tgt_boxes = output_coord
-#             pos_relation = self.position_relation_embedding(src_boxes, tgt_boxes).flatten(0, 1)
-#             if attn_mask is not None:
-#                 pos_relation.masked_fill_(attn_mask, float("-inf"))
-
-#             # iterative bounding box refinement
-#             reference_points = output_coord.detach()
-
-#         outputs_classes = torch.stack(outputs_classes)
-#         outputs_coords = torch.stack(outputs_coords)
-#         return outputs_classes, outputs_coords
-
-
-
-
 
 
 class Box2DDistFun(nn.Module):
@@ -622,34 +507,6 @@ class SsmTransformerDecoder(nn.Module):
             # key_padding_mask: [B, L] -> [B, L']
             key_padding_mask = torch.gather(key_padding_mask, 1, foreground_inds) # [2,9500]
 
-
-        # 获取memory_pos
-        # if value.shape[1] % num_queries != 0: # value: [2,18609,256]
-        #     # 计算需要保留的点数（向下取整为num_queries的整数倍）
-        #     keep_points = (value.shape[1] // num_queries) * num_queries # 18600
-            
-        #     # 均匀采样（保持分布同时尽量保留顺序关系）
-        #     indices = torch.linspace(0, value.shape[1]-1, keep_points, dtype=torch.long, device=value.device)
-            
-        #     # 调整所有相关张量
-        #     value = value[:, indices] # [2,18600,256]
-        #     if key_padding_mask is not None:
-        #         key_padding_mask = key_padding_mask[:, indices] # [2,18600]
-
-        #     # 获取memory_pos
-        #     memory_pos = self.get_memory_pos(spatial_shapes, level_start_index, value.device)
-        #     # 确保memory_pos的batch维度正确
-        #     if memory_pos.shape[0] == 1 and value.shape[0] > 1:
-        #         memory_pos = memory_pos.expand(value.shape[0], -1, -1)
-        #     # 对memory_pos也应用相同的采样
-        #     memory_pos = memory_pos[:, indices] # [2,18600,2]
-            
-        # else:
-        #     # 如果不需要调整，正常获取memory_pos
-        #     memory_pos = self.get_memory_pos(spatial_shapes, level_start_index, value.device)
-        #     if memory_pos.shape[0] == 1 and value.shape[0] > 1:
-        #         memory_pos = memory_pos.expand(value.shape[0], -1, -1)
-        
         # query: 原有的处理逻辑 [2,300,4]
         query_sine_embed = get_sine_pos_embed(
             reference_points, self.embed_dim // 2, exchange_xy=False)
@@ -748,7 +605,7 @@ class SsmTransformerDecoderLayer(nn.Module):
         ssm_expand=2,
         ssm_use_biscan=True,
         last_layer=False,
-        chunk_size=128,
+        chunk_size=32,
     ):
         super().__init__()
         self.d_model = d_model # embed_dim
@@ -1154,6 +1011,13 @@ class MultiHead2DISSM(nn.Module):
         self.key_norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False)
         self.query_norm = nn.LayerNorm(self.d_inner)
 
+    def init_weights(self):
+        nn.init.xavier_uniform_(self.key_proj.weight)
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        nn.init.xavier_uniform_(self.bc_proj.weight)
+        nn.init.xavier_uniform_(self.dt_proj.weight)
+        nn.init.xavier_uniform_(self.out_key_proj.weight)
+        nn.init.xavier_uniform_(self.out_query_proj.weight)
 
     def forward(self, in_key, in_query, dist, key_pos=None, mask=None):
         """
@@ -1383,7 +1247,6 @@ class MultiHead2DISSM(nn.Module):
             print(f"Error in ISSM_chunk_scan_combined: {e}")
             print_gpu_memory()
             raise
-
     # def scan(self, x, initial_states, dt, A, B, C, module_kwargs):
     #     """
     #     Perform unidirectional or bidirectional scan

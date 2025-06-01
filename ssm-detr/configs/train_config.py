@@ -6,7 +6,7 @@ from optimizer import param_dict
 
 # Commonly changed training configurations
 num_epochs = 12   # train epochs
-batch_size = 2    # total_batch_size = #GPU x batch_size
+batch_size = 1    # total_batch_size = #GPU x batch_size
 num_workers = 4   # workers for pytorch DataLoader
 pin_memory = True # whether pin_memory for pytorch DataLoader
 print_freq = 50   # frequency to print logs

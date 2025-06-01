@@ -69,7 +69,7 @@ transformer = SsmTransformer(
     num_classes=num_classes,
     num_feature_levels=num_feature_levels,
     two_stage_num_proposals=num_queries,
-    level_filter_ratio=(0.1, 0.2, 1.0, 1.0),
+    level_filter_ratio=(0.05, 0.2, 0.8, 1.0),
     layer_filter_ratio=(1.0, 0.8, 0.6, 0.6, 0.4, 0.2),
 )
 
