@@ -52,7 +52,8 @@ class TestSalienceTransformer(unittest.TestCase):
                     activation="relu",
                     dim_feedforward=self.dim_feedforward,
                     num_proposal=self.num_queries,
-                    ssm_use_biscan=True, # TODO: test purposes
+                    ssm_use_biscan=True, # TODO: test purposes,
+                    chunk_size=32,
                 ),
                 num_layers=self.transformer_dec_layers,
                 num_classes=self.num_classes,
@@ -60,7 +61,7 @@ class TestSalienceTransformer(unittest.TestCase):
             num_classes=self.num_classes,
             num_feature_levels=self.num_feature_levels,
             two_stage_num_proposals=self.num_queries,
-            level_filter_ratio=(0.3, 0.7, 1.0, 1.0),
+            level_filter_ratio=(0.3, 0.4, 0.8, 0.8),
             layer_filter_ratio=(1.0, 0.8, 0.6, 0.6, 0.4, 0.2),
         ).to(self.device)
 

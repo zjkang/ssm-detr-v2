@@ -61,7 +61,8 @@ transformer = SsmTransformer(
             dropout=0.1,
             activation="relu",
             dim_feedforward=dim_feedforward,
-            num_proposal=num_queries
+            num_proposal=num_queries,
+            chunk_size=32,
         ),
         num_layers=transformer_dec_layers,
         num_classes=num_classes,

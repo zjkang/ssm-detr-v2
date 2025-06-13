@@ -20,6 +20,9 @@ from typing import Optional, Tuple, Dict
 from models.bricks.basic import MLP
 from models.bricks.position_encoding import get_sine_pos_embed
 
+from issm_triton.issm_combined import ISSM_chunk_scan_combined
+from issm_triton.layernorm_gated import RMSNorm as RMSNormGated
+
 
 class MaskPredictor(nn.Module):
     def __init__(self, in_dim, h_dim):
@@ -402,6 +405,178 @@ def _get_activation_fn(activation):
         raise RuntimeError(f"activation should be relu/gelu/silu, not {activation}")
 
 
+class SamplingOffsetPredictor(nn.Module):
+    """预测采样点偏移量"""
+    def __init__(
+            self, 
+            d_model, 
+            n_heads, 
+            n_levels, 
+            n_points):
+        super().__init__()
+        self.predictor = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        self.n_heads = n_heads
+        self.n_levels = n_levels
+        self.n_points = n_points
+        self.init_weights()
+        
+    def init_weights(self):
+        nn.init.xavier_uniform_(self.predictor.weight)
+        nn.init.constant_(self.predictor.bias, 0)
+        
+    def forward(self, query):
+        batch_size = query.shape[0]
+        offsets = self.predictor(query)  # [batch_size, num_queries, n_heads * n_levels * n_points * 2]
+        # [batch_size, num_queries, n_heads, n_levels, n_points, 2]
+        return offsets.view(batch_size, -1, self.n_heads, self.n_levels, self.n_points, 2)
+
+
+class AttentionWeightPredictor(nn.Module):
+    """改进的注意力权重预测器"""
+    def __init__(
+            self, 
+            d_model, 
+            n_heads, 
+            n_levels, 
+            n_points, 
+            temperature=1.0):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_levels = n_levels
+        self.n_points = n_points
+        self.temperature = temperature
+        
+        # 权重预测
+        self.weight_predictor = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, n_heads * n_levels * n_points)
+        )
+        # 前景分数缩放因子
+        self.fg_scale = nn.Parameter(torch.ones(1))
+        # 层级权重
+        self.level_weights = nn.Parameter(torch.ones(n_levels))
+        self.init_weights()
+        
+    def init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+                
+    def forward(self, query, foreground_score=None):
+        """
+        Args:
+            query: [batch_size, num_queries, d_model]
+            foreground_score: [batch_size, num_keys] 可选的前景分数
+        Returns:
+            weights: [batch_size, num_queries, n_heads, n_levels, n_points]
+        """
+        batch_size = query.shape[0]
+        
+        # 预测基础权重
+        weights = self.weight_predictor(query)  # [batch_size, num_queries, n_heads * n_levels * n_points]
+        weights = weights.view(batch_size, -1, self.n_heads, self.n_levels, self.n_points)
+        # 应用温度参数
+        weights = weights / self.temperature
+        # 采样点进行归一化
+        weights = F.softmax(weights, dim=-1)  # 对n_points维度归一化
+        # 应用层级权重
+        level_weights = F.softmax(self.level_weights, dim=0)  # 对n_levels维度归一化
+        weights = weights * level_weights.view(1, 1, 1, -1, 1)
+        # 结合前景分数（如果提供）
+        if foreground_score is not None:
+            # 使用可学习的缩放因子
+            fg_score = foreground_score.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            fg_score = torch.sigmoid(self.fg_scale * fg_score)  # 将前景分数映射到[0,1]
+            weights = weights * fg_score
+        # [batch_size, num_queries, n_heads, n_levels, n_points] 
+        return weights 
+
+
+class FeatureSampler(nn.Module):
+    """特征采样器"""
+    def __init__(self, n_levels):
+        super().__init__()
+        self.n_levels = n_levels
+        # 假设stride为[8,16,32]
+        self.register_buffer('strides', torch.tensor([8, 16, 32]))
+        
+    def forward(self, features, reference_points, sampling_offsets):
+        """
+        Args:
+            features: [batch_size, num_keys, d_model]
+            reference_points: [batch_size, num_queries, 2]
+            sampling_offsets: [batch_size, num_queries, n_heads, n_levels, n_points, 2]
+        """
+        batch_size = features.shape[0]
+        strides = self.strides.view(1, 1, 1, self.n_levels, 1, 1)
+        
+        # 计算采样点位置
+        sampling_points = reference_points.unsqueeze(2).unsqueeze(3).unsqueeze(4) + \
+                         sampling_offsets / strides
+        
+        # 这里需要实现实际的采样逻辑
+        # 为了示例，这里返回一个随机张量
+        return torch.randn(batch_size, features.shape[1], sampling_offsets.shape[2], 
+                         self.n_levels, sampling_offsets.shape[4], features.shape[-1], 
+                         device=features.device)
+
+
+class DynamicTokenSelection(nn.Module):
+    def __init__(
+            self,
+            d_model,
+            n_heads,
+            n_levels=4,
+            n_points=4,
+            dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_levels = n_levels
+        self.n_points = n_points
+        
+        # 模块化组件
+        self.offset_predictor = SamplingOffsetPredictor(d_model, n_heads, n_levels, n_points)
+        self.weight_predictor = AttentionWeightPredictor(d_model, n_heads, n_levels, n_points)
+        self.feature_sampler = FeatureSampler(n_levels)
+        
+        # 输出投影
+        self.output_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        self._reset_parameters()
+        
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        nn.init.constant_(self.output_proj.bias, 0)
+        
+    def forward(self, query, key, value, reference_points, key_padding_mask=None, foreground_score=None):
+        """
+        Args:
+            query: [batch_size, num_queries, d_model]
+            key: [batch_size, num_keys, d_model]
+            value: [batch_size, num_keys, d_model]
+            reference_points: [batch_size, num_queries, 2] 外部提供的参考点
+            key_padding_mask: [batch_size, num_keys]
+            foreground_score: [batch_size, num_keys] 前景分数
+        """
+        # 预测采样点偏移量
+        sampling_offsets = self.offset_predictor(query)
+        # 预测注意力权重
+        attention_weights = self.weight_predictor(query, foreground_score)
+        # 特征采样
+        sampled_features = self.feature_sampler(key, reference_points, sampling_offsets)
+        # 计算注意力输出
+        output = torch.einsum('bqhlp,bqhlpd->bqhd', attention_weights, ampled_features)
+        # 输出投影
+        output = self.output_proj(output)
+        output = self.dropout(output)
+        return output
+
+
 class SsmTransformerDecoder(nn.Module):
     """SSM Transformer解码器"""
     def __init__(
@@ -462,7 +637,6 @@ class SsmTransformerDecoder(nn.Module):
         for bbox_head in self.bbox_head:
             nn.init.constant_(bbox_head.layers[-1].weight, 0.0)
             nn.init.constant_(bbox_head.layers[-1].bias, 0.0)
-
         # initialize ref_point_head
         nn.init.xavier_uniform_(self.ref_point_head[0].weight)
 
@@ -480,36 +654,12 @@ class SsmTransformerDecoder(nn.Module):
         focus_token_nums=None, # [2] -> [9509, 9509]
         foreground_inds=None, # [2,9509]
     ):
-        # 确保特征点数量是查询数量的整数倍
-        num_queries = query.shape[1]  # 通常是300
-        # query vs chunk_size
-        # 计算需要保留的点数（L向下取整为num_queries的整数倍）
-        # nchunks = math.ceil(seqlen / chunk_size)
-        chunk_size = self.chunk_size
-        keep_points = (foreground_inds.shape[1] // chunk_size) * chunk_size # 9500
-        foreground_inds = foreground_inds[:, :keep_points] # [2,9500]
-            
-        # 使用gather一次性选择所有batch的tokens
-        # 扩展indices维度以匹配value的维度
-        # foreground_inds: [B, L'] -> [B, L', 1]
-        indices = foreground_inds.unsqueeze(-1)
-        # 选择value tokens
-        # value: [B, L, D] -> [B, L', D]
-        value = torch.gather(value, 1, indices.expand(-1, -1, value.size(-1))) # [2,9500,256]
-        # 选择memory_pos tokens
-        # memory_pos: [B, L, 2] -> [B, L', 2]
+
         memory_pos = self.get_memory_pos(spatial_shapes, level_start_index, value.device)
         if memory_pos.shape[0] == 1 and value.shape[0] > 1:
             memory_pos = memory_pos.expand(value.shape[0], -1, -1)
-        memory_pos = torch.gather(memory_pos, 1, indices.expand(-1, -1, memory_pos.size(-1))) # [2,9500,2]
-        # 选择mask tokens
-        if key_padding_mask is not None:
-            # key_padding_mask: [B, L] -> [B, L']
-            key_padding_mask = torch.gather(key_padding_mask, 1, foreground_inds) # [2,9500]
-
         # query: 原有的处理逻辑 [2,300,4]
-        query_sine_embed = get_sine_pos_embed(
-            reference_points, self.embed_dim // 2, exchange_xy=False)
+        query_sine_embed = get_sine_pos_embed(reference_points, self.embed_dim // 2, exchange_xy=False)
         query_pos_embed = self.ref_point_head(query_sine_embed) # [2,300,256]
 
         outputs_classes, outputs_coords = [], []
@@ -620,6 +770,9 @@ class SsmTransformerDecoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
+        self.dynamic_token_selection = DynamicTokenSelection(
+            d_model, nhead, n_levels=4, n_points=4, dropout=dropout)
+
         self.ssm = MultiHead2DISSM(
             d_model=d_model,
             d_state=num_proposal, # state dimension is # of queries
@@ -658,7 +811,6 @@ class SsmTransformerDecoderLayer(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        """初始化权重"""
         # initialize self_attention
         nn.init.xavier_uniform_(self.self_attn.in_proj_weight)
         nn.init.xavier_uniform_(self.self_attn.out_proj.weight)
@@ -669,18 +821,15 @@ class SsmTransformerDecoderLayer(nn.Module):
         nn.init.xavier_uniform_(self.linear2_query.weight)
 
     def with_pos_embed(self, tensor, pos):
-        """添加位置编码"""
         return tensor if pos is None else tensor + pos
 
     def forward_ffn_memory(self, x):
-        """前馈网络前向传播"""
         x2 = self.linear2_memory(self.dropout_memory(self.activation(self.linear1_memory(x))))
         x = x + self.dropout3_memory(x2) # 
         x = self.norm3_memory(x)
         return x
 
     def forward_ffn_query(self, x):
-        """前馈网络前向传播"""
         x2 = self.linear2_query(self.dropout_query(self.activation(self.linear1_query(x))))
         x = x + self.dropout3_query(x2)
         x = self.norm3_query(x)
@@ -834,6 +983,7 @@ class SsmTransformerDecoderLayer(nn.Module):
         level_start_index,  # [num_levels] - 层级起始索引
         memory_key_padding_mask=None,  # [B, L] - 记忆键填充掩码
         layer_idx=None,     # 层索引，用于选择不同的序列化策略
+        foreground_score=None, # [2,L]
     ):
         # 自注意力 [2,300,256]
         query_with_pos = key_with_pos = self.with_pos_embed(query, query_pos_embed)
@@ -848,20 +998,13 @@ class SsmTransformerDecoderLayer(nn.Module):
 
         # 提取参考点的中心和尺寸
         # 对于多尺度特征，取第一个级别的参考点
-       # If reference_points has shape [B, Q, 4] with format (x,y,w,h)
+        # If reference_points has shape [B, Q, 4] with format (x,y,w,h)
         center_points = reference_points[..., 0, :2]  # Extract (x,y) -> [(2)B, (300)Q, 2]
         box_sizes = reference_points[..., 0, 2:]      # Extract (w,h) -> [(2)B, (300)Q, 2]
 
-        # 确保memory_pos的batch维度正确
-        if memory_pos.shape[0] == 1 and memory.shape[0] > 1:
-            memory_pos = memory_pos.expand(memory.shape[0], -1, -1)
-    
-        # 选择序列化策略
-        strategy = self.serialization_strategy
-        # 获取序列化顺序
-        # serialization_indices: [(2)B, (9500)L] - 序列化顺序索引
-        # TODO: optimize
-        serialization_indices = self.get_serialization_order(memory_pos, center_points, strategy)
+        # 选择序列化策略 TODO: optimize
+        # 获取序列化顺序 serialization_indices: [(2)B, (9500)L] - 序列化顺序索引
+        serialization_indices = self.get_serialization_order(memory_pos, center_points, self.serialization_strategy)
 
         # 根据序列化顺序重排记忆和位置
         B = memory.shape[0] # 2
@@ -879,7 +1022,6 @@ class SsmTransformerDecoderLayer(nn.Module):
                 valid_mask = (~memory_key_padding_mask).float() # [(2)B, (9500)L]
             else:
                 valid_mask = 1.0 - memory_key_padding_mask
-                
             # 重排掩码
             reordered_valid_mask = valid_mask[batch_indices, serialization_indices] # [(2)B, (9500)L]
         else:
@@ -892,11 +1034,12 @@ class SsmTransformerDecoderLayer(nn.Module):
         weights = weights * reordered_valid_mask.unsqueeze(-1)  # 应用有效掩码 [(2)B, (9500)L, (300)Q]
 
         # 计算空间距离编码 (使用重排后的位置)
+        # [(2)B, (9500)L, (300)Q, (16)D]; dist embedding?
         dist = self.spatial_dist(
             key_pos=reordered_memory_pos,
             query_center=center_points,
             query_size=box_sizes,
-        ) # [(2)B, (9500)L, (300)Q, (16)D]; dist embedding?
+        )
 
         # 应用SSM
         memory2, query2 = self.ssm(
@@ -932,15 +1075,11 @@ class SsmTransformerDecoderLayer(nn.Module):
         return query, memory
 
 
-from issm_triton.issm_combined import ISSM_chunk_scan_combined
-from issm_triton.layernorm_gated import RMSNorm as RMSNormGated
-
 class MultiHead2DISSM(nn.Module):
-    """2D版本的多头ISSM扫描模块，使用ISSM_chunk_scan_combined"""
     def __init__(
         self,
         d_model: int = 256,        # 输入维度
-        d_state: int = 64,         # 状态维度 same as num_proposal
+        d_state: int = 64,         # 状态维度 same as num_queries
         d_dist: int = 16,          # 距离编码维度
         chunk_size: int = 32,      # 使用较小的chunk_size
         nheads: int = 8,           # 注意力头数
@@ -1239,7 +1378,6 @@ class MultiHead2DISSM(nn.Module):
                 initial_states=initial_states,
                 **module_kwargs,
             )
-            
             # print("\nAfter processing single batch:")
             # print_gpu_memory()
             return y, last_states
@@ -1247,6 +1385,7 @@ class MultiHead2DISSM(nn.Module):
             print(f"Error in ISSM_chunk_scan_combined: {e}")
             print_gpu_memory()
             raise
+    
     # def scan(self, x, initial_states, dt, A, B, C, module_kwargs):
     #     """
     #     Perform unidirectional or bidirectional scan
